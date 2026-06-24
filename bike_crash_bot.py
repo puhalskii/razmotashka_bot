@@ -4,12 +4,12 @@
 - Онбординг при /start с проверкой прав на канал
 - Каждый пользователь работает со своим каналом
 - Индивидуальные задания в планировщике для каждого пользователя
+- Возможность поставить постинг на паузу (/pause) и возобновить (/resume)
 """
 
 import os
 import logging
 import sqlite3
-import json
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
@@ -47,6 +47,7 @@ def db_connect():
             mode         INTEGER DEFAULT 1,
             freq         TEXT DEFAULT '7d',
             running      INTEGER DEFAULT 0,
+            paused       INTEGER DEFAULT 0,
             last_msg_id  TEXT,
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -58,7 +59,7 @@ def get_user(user_id):
     """Получает настройки пользователя."""
     with db_connect() as conn:
         row = conn.execute(
-            "SELECT channel_id, mode, freq, running, last_msg_id FROM users WHERE user_id=?",
+            "SELECT channel_id, mode, freq, running, paused, last_msg_id FROM users WHERE user_id=?",
             (user_id,)
         ).fetchone()
         if row:
@@ -67,7 +68,8 @@ def get_user(user_id):
                 "mode": row[1],
                 "freq": row[2],
                 "running": row[3],
-                "last_msg_id": row[4]
+                "paused": row[4],
+                "last_msg_id": row[5]
             }
         return None
 
@@ -135,6 +137,11 @@ def is_running(user_id):
     user = get_user(user_id)
     return user["running"] == 1 if user else False
 
+def is_paused(user_id):
+    """Постинг на паузе?"""
+    user = get_user(user_id)
+    return user["paused"] == 1 if user else False
+
 async def delete_last_channel_message(bot, user_id, channel_id):
     """Удаляет предыдущее сообщение бота в канале если есть."""
     user = get_user(user_id)
@@ -167,6 +174,10 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
     if not user:
         # Пользователь удалён, удаляем задание
         context.job.schedule_removal()
+        return
+
+    # Проверка паузы - если на паузе, ничего не делаем
+    if user["paused"] == 1:
         return
 
     mode = user["mode"]
@@ -204,6 +215,10 @@ def schedule_for_user(app, user_id):
 
     user = get_user(user_id)
     if not user or not user["channel_id"]:
+        return
+
+    # Если пауза - не создаём задание
+    if user["paused"] == 1:
         return
 
     # В режиме 2 если running=0 - не создаём задание
@@ -317,6 +332,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     mode = user["mode"]
     freq = get_freq_label(user_id)
     running = "запущен ✅" if user["running"] == 1 else "остановлен ⏸"
+    paused = "приостановлен ⏸" if user["paused"] == 1 else "активен ▶️"
     channel = user["channel_id"]
     
     message = (
@@ -324,13 +340,16 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
         f"📌 Канал: `{channel}`\n"
         f"📊 Режим: *{mode}*\n"
         f"⏱ Частота: *{freq}*\n"
-        f"▶️ Автопост: *{running}*\n\n"
+        f"▶️ Автопост: *{running}*\n"
+        f"⏸ Статус: *{paused}*\n\n"
         "*Команды:*\n"
         "/ask - режим опроса\n"
         "/autopost - режим автопоста\n"
         "/setfreq - задать частоту\n"
         "/start_autopost - запустить автопост\n"
         "/stop_autopost - остановить автопост\n"
+        "/pause - приостановить все посты\n"
+        "/resume - возобновить посты\n"
         "/crashed - зафиксировать падение\n"
         "/checkin - ручной чекин\n"
         "/status - текущие настройки\n"
@@ -350,7 +369,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сбрасывает настройки пользователя."""
     user_id = update.effective_user.id
-    update_user(user_id, channel_id=None, mode=1, freq="7d", running=0, last_msg_id=None)
+    update_user(user_id, channel_id=None, mode=1, freq="7d", running=0, paused=0, last_msg_id=None)
     
     # Удаляем задание
     for job in context.application.job_queue.jobs():
@@ -377,6 +396,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = user["mode"]
     freq = get_freq_label(user_id)
     running = "запущен ✅" if user["running"] == 1 else "остановлен ⏸"
+    paused = "приостановлен ⏸" if user["paused"] == 1 else "активен ▶️"
     last_id = user["last_msg_id"] or "нет"
     channel = user["channel_id"]
     
@@ -387,6 +407,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 Режим: *{mode}*\n"
         f"⏱ Частота: *{freq}*\n"
         f"▶️ Автопост: *{running}*\n"
+        f"⏸ Пауза: *{paused}*\n"
         f"📨 Последнее сообщение: `{last_id}`",
         parse_mode="Markdown"
     )
@@ -471,6 +492,61 @@ async def stop_autopost(update: Update, context: ContextTypes.DEFAULT_TYPE):
             job.schedule_removal()
     
     await update.message.reply_text("⏸ Автопост остановлен.")
+
+
+# - КОМАНДА /pause ------------------------------------------------------------
+
+async def pause_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приостанавливает все посты (и опрос, и автопост)."""
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+    
+    if not user or not user["channel_id"]:
+        await update.message.reply_text("Сначала настрой бота через /start")
+        return
+    
+    if user["paused"] == 1:
+        await update.message.reply_text("⏸ Посты уже приостановлены.")
+        return
+    
+    update_user(user_id, paused=1)
+    # Удаляем задание
+    for job in context.application.job_queue.jobs():
+        if job.data and job.data.get("user_id") == user_id:
+            job.schedule_removal()
+    
+    await update.message.reply_text(
+        "⏸ *Все посты приостановлены.*\n"
+        "Бот не будет ничего спрашивать и постить.\n"
+        "Чтобы возобновить, используй /resume.",
+        parse_mode="Markdown"
+    )
+
+
+# - КОМАНДА /resume -----------------------------------------------------------
+
+async def resume_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возобновляет все посты."""
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+    
+    if not user or not user["channel_id"]:
+        await update.message.reply_text("Сначала настрой бота через /start")
+        return
+    
+    if user["paused"] == 0:
+        await update.message.reply_text("▶️ Посты уже активны.")
+        return
+    
+    update_user(user_id, paused=0)
+    # Создаём задание заново
+    schedule_for_user(context.application, user_id)
+    
+    await update.message.reply_text(
+        "▶️ *Посты возобновлены.*\n"
+        f"Бот снова работает в режиме *{user['mode']}* с частотой {get_freq_label(user_id)}.",
+        parse_mode="Markdown"
+    )
 
 
 # - КОМАНДА /setfreq ----------------------------------------------------------
@@ -639,6 +715,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*УПРАВЛЕНИЕ:*\n"
         "/start_autopost - запустить автопост\n"
         "/stop_autopost - остановить автопост\n"
+        "/pause - приостановить *все* посты (и опрос, и автопост)\n"
+        "/resume - возобновить посты\n"
         "/crashed - зафиксировать падение и остановить автопост\n"
         "/checkin - ручной чекин с кнопками\n\n"
         "*НАСТРОЙКИ:*\n"
@@ -743,6 +821,8 @@ def main():
     app.add_handler(CommandHandler("autopost", set_mode2))
     app.add_handler(CommandHandler("start_autopost", start_autopost))
     app.add_handler(CommandHandler("stop_autopost", stop_autopost))
+    app.add_handler(CommandHandler("pause", pause_all))
+    app.add_handler(CommandHandler("resume", resume_all))
     app.add_handler(CommandHandler("crashed", crashed))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("reset", reset))
@@ -753,7 +833,7 @@ def main():
         catch_buttons
     ))
     
-    # Запускаем задания для всех пользователей
+    # Запускаем задания для всех пользователей (только не на паузе)
     app.job_queue.start()
     for user_id in get_all_users():
         schedule_for_user(app, user_id)
