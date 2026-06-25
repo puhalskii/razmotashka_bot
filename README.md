@@ -75,6 +75,26 @@ journalctl -u bike_crash_bot -f
 
 ---
 
+## Обновление бота
+
+Тот же install.sh, с флагом `--upgrade` (или `-u`). Токен не спрашивает заново -
+берёт уже сохранённый из systemd-сервиса. Перекачивает свежий `bike_crash_bot.py`
+с GitHub, обновляет зависимости и перезапускает сервис. БД пользователей не трогает.
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/puhalskii/razmotashka_bot/main/install.sh)" -- --upgrade
+```
+
+Перед обновлением старый `bike_crash_bot.py` сохраняется как `bike_crash_bot.py.bak`
+в `/opt/bike_crash_bot/` - если новая версия не заработает, можно откатиться:
+
+```bash
+sudo cp /opt/bike_crash_bot/bike_crash_bot.py.bak /opt/bike_crash_bot/bike_crash_bot.py
+sudo systemctl restart bike_crash_bot
+```
+
+---
+
 ## Локальный запуск для теста
 
 ```bash
