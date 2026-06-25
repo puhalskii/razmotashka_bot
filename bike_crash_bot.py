@@ -22,10 +22,29 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DB_PATH   = os.environ.get("DB_PATH", "/var/lib/bike_crash_bot/state.db")
 ACTIONS_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_actions.log")
 
+# Кнопки опроса - общие для всех пользователей, не настраиваются
+BTN_NO  = "Неа 🚴"
+BTN_YES = "Ага 💥"
+
+# Тексты вопросов/постов/ответов по умолчанию (тема "Размотался").
+# Пользователь может переопределить через /customtexts - см. WIZARD_FIELDS.
+TEXT_DEFAULTS = {
+    "text_question":      "Размотался, дурак?",
+    "text_checkin":       "Размотался? Признавайся.",
+    "text_post_no":       "всё ещё не размотался 🚴✅",
+    "text_post_yes":      "всё-таки размотался 💥",
+    "text_reply_no":      "Шикос, отправил в канал. Пусть завидуют 🎉",
+    "text_reply_yes":     "Ну в целом ожидаемо. Отправил в канал пусть посмеются.",
+    "text_reply_invalid": "Тыкай в кнопки, тупица!",
+    "text_crashed_reply": "💥 Зафиксировал. Автопост остановлен.\nНадеюсь всё норм, дурак 🤕",
+}
+MAX_CUSTOM_TEXT_LEN = 200
+
 # - СОСТОЯНИЯ ДИАЛОГОВ --------------------------------------------------------
-WAITING_FOR_CHANNEL = 10
-WAITING_FOR_FREQ    = 20
-WAITING_FOR_CHECK   = 30
+WAITING_FOR_CHANNEL    = 10
+WAITING_FOR_FREQ       = 20
+WAITING_FOR_CHECK      = 30
+WAITING_FOR_CUSTOM_TEXT = 40
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -36,23 +55,39 @@ logger = logging.getLogger(__name__)
 
 # - БАЗА ДАННЫХ ---------------------------------------------------------------
 
+def _sql_escape(value):
+    """Эскейпит одиночные кавычки для вставки литерала в SQL (для своих, не пользовательских строк)."""
+    return value.replace("'", "''")
+
+def _migrate_text_columns(conn):
+    """Добавляет колонки с кастомными текстами в уже существующие базы (старые версии бота)."""
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+    for col, default in TEXT_DEFAULTS.items():
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT '{_sql_escape(default)}'")
+
 def db_connect():
-    """Открывает соединение с БД, создаёт таблицу если нет."""
+    """Открывает соединение с БД, создаёт таблицу/колонки если нет."""
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("""
+    text_columns = ", ".join(
+        f"{col} TEXT DEFAULT '{_sql_escape(default)}'" for col, default in TEXT_DEFAULTS.items()
+    )
+    conn.execute(f"""
         CREATE TABLE IF NOT EXISTS users (
             user_id    INTEGER PRIMARY KEY,
             channel_id TEXT,
             mode       INTEGER DEFAULT 1,
             freq       TEXT    DEFAULT '7d',
             running    INTEGER DEFAULT 0,
-            last_msg_id INTEGER
+            last_msg_id INTEGER,
+            {text_columns}
         )
     """)
+    _migrate_text_columns(conn)
     conn.commit()
     return conn
 
@@ -132,6 +167,10 @@ def is_registered(user):
     """Пользователь зарегистрирован и канал задан?"""
     return user and user.get("channel_id")
 
+def get_text(user, key):
+    """Кастомный текст пользователя или дефолт темы "Размотался", если не задан."""
+    return user.get(key) or TEXT_DEFAULTS[key]
+
 
 # - ПЛАНИРОВЩИК ---------------------------------------------------------------
 
@@ -146,19 +185,18 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
 
     if user["mode"] == 1:
         # Режим опроса - спрашиваем
-        keyboard     = [["Неа 🚴", "Ага 💥"]]
+        keyboard     = [[BTN_NO, BTN_YES]]
         reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
         await context.bot.send_message(
             chat_id=user_id,
-            text="Эй! 🏍️ Плановая проверка:\n\n*Размотался, дурак?*",
-            parse_mode="Markdown",
+            text=f"Эй! 🏍️ Плановая проверка:\n\n{get_text(user, 'text_question')}",
             reply_markup=reply_markup,
         )
     elif user["mode"] == 2 and user["running"]:
         # Режим автопоста - постим сами
         await post_to_channel(
             context.bot, user,
-            f"📅 {today}: всё ещё не размотался 🚴✅"
+            f"📅 {today}: {get_text(user, 'text_post_no')}"
         )
 
 def reschedule_user(app, user_id, freq):
@@ -208,6 +246,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/checkin - ручной чекин\n"
             "/status - текущие настройки\n"
             "/setchannel - сменить канал\n"
+            "/customtexts - свои тексты вместо темы «Размотался»\n"
             "/help - справка",
             parse_mode="Markdown"
         )
@@ -418,14 +457,14 @@ async def handle_freq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not is_registered(user_get(user_id)):
+    user    = user_get(user_id)
+    if not is_registered(user):
         await update.message.reply_text("Сначала зарегистрируйся командой /start")
         return
-    keyboard     = [["Неа 🚴", "Ага 💥"]]
+    keyboard     = [[BTN_NO, BTN_YES]]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text(
-        "Ручной чекин 🏍️\n\n*Размотался? Признавайся.*",
-        parse_mode="Markdown",
+        f"Ручной чекин 🏍️\n\n{get_text(user, 'text_checkin')}",
         reply_markup=reply_markup,
     )
     return WAITING_FOR_CHECK
@@ -437,23 +476,23 @@ async def handle_checkin_answer(update: Update, context: ContextTypes.DEFAULT_TY
     today   = datetime.now().strftime("%d.%m.%Y")
 
     if "Неа" in text:
-        await post_to_channel(context.bot, user, f"📅 {today}: всё ещё не размотался 🚴✅")
+        await post_to_channel(context.bot, user, f"📅 {today}: {get_text(user, 'text_post_no')}")
         log_action(user_id, "ручной чекин (/checkin): не размотался")
         await update.message.reply_text(
-            "Шикос, отправил в канал. Пусть завидуют 🎉",
+            get_text(user, "text_reply_no"),
             reply_markup=ReplyKeyboardRemove()
         )
     elif "Ага" in text:
-        await post_to_channel(context.bot, user, f"📅 {today}: всё-таки размотался 💥")
+        await post_to_channel(context.bot, user, f"📅 {today}: {get_text(user, 'text_post_yes')}")
         user_set(user_id, running=0)
         log_action(user_id, "ручной чекин (/checkin): размотался")
         await update.message.reply_text(
-            "Ну в целом ожидаемо. Отправил в канал пусть посмеются.",
+            get_text(user, "text_reply_yes"),
             reply_markup=ReplyKeyboardRemove()
         )
     else:
         await update.message.reply_text(
-            "Тыкай в кнопки, тупица!",
+            get_text(user, "text_reply_invalid"),
             reply_markup=ReplyKeyboardRemove()
         )
         return WAITING_FOR_CHECK
@@ -470,13 +509,10 @@ async def crashed(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала зарегистрируйся командой /start")
         return
     today = datetime.now().strftime("%d.%m.%Y")
-    await post_to_channel(context.bot, user, f"📅 {today}: всё-таки размотался 💥")
+    await post_to_channel(context.bot, user, f"📅 {today}: {get_text(user, 'text_post_yes')}")
     user_set(user_id, running=0)
     log_action(user_id, "зафиксировал падение (/crashed)")
-    await update.message.reply_text(
-        "💥 Зафиксировал. Автопост остановлен.\n"
-        "Надеюсь всё норм, дурак 🤕"
-    )
+    await update.message.reply_text(get_text(user, "text_crashed_reply"))
 
 
 # - КОМАНДА /help -------------------------------------------------------------
@@ -501,11 +537,96 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  3d = каждые 3 дня\n"
         "  1w = каждую неделю\n"
         "/setchannel - сменить канал\n"
+        "/customtexts - настроить свои тексты вопросов/постов/ответов\n"
+        "/resettexts - вернуть стандартные тексты\n"
         "/status - показать текущие настройки\n\n"
         "ПРОЧЕЕ:\n"
         "/start - главное меню\n"
         "/help - эта справка"
     )
+
+
+# - КОМАНДА /customtexts (пошаговый wizard) -----------------------------------
+
+WIZARD_FIELDS = [
+    ("text_question",     "Вопрос при плановой проверке по расписанию"),
+    ("text_checkin",       "Вопрос при ручном чекине (/checkin)"),
+    ("text_post_no",       f"Текст поста в канал на «{BTN_NO}» (что не случилось)"),
+    ("text_post_yes",      f"Текст поста в канал на «{BTN_YES}» (что случилось)"),
+    ("text_reply_no",      f"Личный ответ тебе после «{BTN_NO}»"),
+    ("text_reply_yes",     f"Личный ответ тебе после «{BTN_YES}»"),
+    ("text_reply_invalid", "Ответ, если вместо кнопки пришло что-то другое"),
+    ("text_crashed_reply", "Ответ на команду /crashed"),
+]
+
+async def customtexts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_registered(user_get(user_id)):
+        await update.message.reply_text("Сначала зарегистрируйся командой /start")
+        return ConversationHandler.END
+    context.user_data["wizard_idx"] = 0
+    await update.message.reply_text(
+        "✏️ Настройка своих текстов вместо темы «Размотался».\n\n"
+        f"Кнопки «{BTN_NO}» / «{BTN_YES}» не меняются - настраиваются только "
+        "тексты вопросов, постов в канал и ответов.\n\n"
+        "На каждом шаге пришли свой текст или /skip чтобы оставить текущий.\n"
+        "/cancel - прервать в любой момент."
+    )
+    return await ask_next_text(update, context)
+
+async def ask_next_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    idx = context.user_data.get("wizard_idx", 0)
+    if idx >= len(WIZARD_FIELDS):
+        await update.message.reply_text(
+            "✅ Готово! Все тексты настроены.\nЧтобы вернуть стандартные - /resettexts."
+        )
+        return ConversationHandler.END
+
+    field, label = WIZARD_FIELDS[idx]
+    user    = user_get(user_id)
+    current = get_text(user, field)
+    await update.message.reply_text(
+        f"({idx + 1}/{len(WIZARD_FIELDS)}) {label}\n\n"
+        f"Текущий текст:\n«{current}»\n\n"
+        "Пришли новый текст или /skip, чтобы оставить этот."
+    )
+    return WAITING_FOR_CUSTOM_TEXT
+
+async def handle_custom_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    idx      = context.user_data.get("wizard_idx", 0)
+    field, _ = WIZARD_FIELDS[idx]
+    text = update.message.text.strip()
+
+    if not text:
+        await update.message.reply_text("Текст не может быть пустым. Пришли текст или /skip.")
+        return WAITING_FOR_CUSTOM_TEXT
+    if len(text) > MAX_CUSTOM_TEXT_LEN:
+        await update.message.reply_text(f"Слишком длинно (максимум {MAX_CUSTOM_TEXT_LEN} символов), напиши короче.")
+        return WAITING_FOR_CUSTOM_TEXT
+
+    user_set(user_id, **{field: text})
+    log_action(user_id, f"настроил текст «{field}» (/customtexts)")
+    context.user_data["wizard_idx"] = idx + 1
+    return await ask_next_text(update, context)
+
+async def skip_custom_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    idx = context.user_data.get("wizard_idx", 0)
+    context.user_data["wizard_idx"] = idx + 1
+    return await ask_next_text(update, context)
+
+
+# - КОМАНДА /resettexts --------------------------------------------------------
+
+async def resettexts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_registered(user_get(user_id)):
+        await update.message.reply_text("Сначала зарегистрируйся командой /start")
+        return
+    user_set(user_id, **TEXT_DEFAULTS)
+    log_action(user_id, "сбросил тексты на стандартные (/resettexts)")
+    await update.message.reply_text("🔄 Тексты сброшены на стандартные (тема «Размотался»).")
 
 
 # - ОТМЕНА --------------------------------------------------------------------
@@ -528,18 +649,18 @@ async def catch_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now().strftime("%d.%m.%Y")
 
     if "Неа" in text:
-        await post_to_channel(context.bot, user, f"📅 {today}: всё ещё не размотался 🚴✅")
+        await post_to_channel(context.bot, user, f"📅 {today}: {get_text(user, 'text_post_no')}")
         log_action(user_id, "ответил на плановую проверку: не размотался")
         await update.message.reply_text(
-            "Шикос, отправил в канал. Пусть завидуют 🎉",
+            get_text(user, "text_reply_no"),
             reply_markup=ReplyKeyboardRemove()
         )
     elif "Ага" in text:
-        await post_to_channel(context.bot, user, f"📅 {today}: всё-таки размотался 💥")
+        await post_to_channel(context.bot, user, f"📅 {today}: {get_text(user, 'text_post_yes')}")
         user_set(user_id, running=0)
         log_action(user_id, "ответил на плановую проверку: размотался")
         await update.message.reply_text(
-            "Ну в целом ожидаемо. Отправил в канал пусть посмеются.",
+            get_text(user, "text_reply_yes"),
             reply_markup=ReplyKeyboardRemove()
         )
 
@@ -595,15 +716,29 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    # Диалог для /customtexts
+    customtexts_handler = ConversationHandler(
+        entry_points=[CommandHandler("customtexts", customtexts)],
+        states={
+            WAITING_FOR_CUSTOM_TEXT: [
+                CommandHandler("skip", skip_custom_text),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_text),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(channel_handler)
     app.add_handler(freq_handler)
     app.add_handler(checkin_handler)
+    app.add_handler(customtexts_handler)
     app.add_handler(CommandHandler("status",         status))
     app.add_handler(CommandHandler("ask",            set_mode_ask))
     app.add_handler(CommandHandler("autopost",       set_mode_autopost))
     app.add_handler(CommandHandler("start_autopost", start_autopost))
     app.add_handler(CommandHandler("stop_autopost",  stop_autopost))
     app.add_handler(CommandHandler("crashed",        crashed))
+    app.add_handler(CommandHandler("resettexts",     resettexts))
     app.add_handler(CommandHandler("help",           help_cmd))
     # Кнопки из планировщика
     app.add_handler(MessageHandler(
