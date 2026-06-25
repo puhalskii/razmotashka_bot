@@ -149,7 +149,7 @@ sudo bash /opt/bike_crash_bot/uninstall.sh --purge
 
 ---
 
-## Настройка частоты
+## Настройка частоты автопостинга
 
 Через команду /setfreq или кнопки в боте.
 
