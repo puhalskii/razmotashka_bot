@@ -41,10 +41,14 @@ TEXT_DEFAULTS = {
 MAX_CUSTOM_TEXT_LEN = 200
 
 # - СОСТОЯНИЯ ДИАЛОГОВ --------------------------------------------------------
-WAITING_FOR_CHANNEL    = 10
-WAITING_FOR_FREQ       = 20
-WAITING_FOR_CHECK      = 30
+WAITING_FOR_CHANNEL     = 10
+WAITING_FOR_FREQ        = 20
+WAITING_FOR_CHECK       = 30
 WAITING_FOR_CUSTOM_TEXT = 40
+WAITING_FOR_RESET_CONFIRM = 50
+
+RESET_CONFIRM_YES = "Да, сбросить всё ⚠️"
+RESET_CONFIRM_NO  = "Отмена"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -247,6 +251,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/status - текущие настройки\n"
             "/setchannel - сменить канал\n"
             "/customtexts - свои тексты вместо темы «Размотался»\n"
+            "/reset - сбросить всё и начать заново\n"
             "/help - справка",
             parse_mode="Markdown"
         )
@@ -539,6 +544,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setchannel - сменить канал\n"
         "/customtexts - настроить свои тексты вопросов/постов/ответов\n"
         "/resettexts - вернуть стандартные тексты\n"
+        "/reset - сбросить ВСЁ (канал, режим, тексты) и начать заново\n"
         "/status - показать текущие настройки\n\n"
         "ПРОЧЕЕ:\n"
         "/start - главное меню\n"
@@ -629,6 +635,48 @@ async def resettexts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Тексты сброшены на стандартные (тема «Размотался»).")
 
 
+# - КОМАНДА /reset (полный сброс пользователя) --------------------------------
+
+async def reset_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not user_get(user_id):
+        await update.message.reply_text("Ты ещё не зарегистрирован. Начни с /start")
+        return ConversationHandler.END
+
+    keyboard     = [[RESET_CONFIRM_YES], [RESET_CONFIRM_NO]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text(
+        "⚠️ Это отключит канал, остановит опрос/автопост и вернёт все тексты "
+        "к стандартным - всё будет как при первом запуске. Отменить нельзя.\n\n"
+        "Точно сбросить всё?",
+        reply_markup=reply_markup,
+    )
+    return WAITING_FOR_RESET_CONFIRM
+
+async def reset_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text    = update.message.text.strip()
+
+    if text != RESET_CONFIRM_YES:
+        await update.message.reply_text("Отменено, настройки не трогал.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    for job in context.application.job_queue.get_jobs_by_name(job_name(user_id)):
+        job.schedule_removal()
+
+    user_set(
+        user_id,
+        channel_id=None, mode=1, freq="7d", running=0, last_msg_id=None,
+        **TEXT_DEFAULTS,
+    )
+    log_action(user_id, "сбросил все настройки (/reset)")
+    await update.message.reply_text(
+        "🔄 Все настройки сброшены.\nНачни заново с /start",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return ConversationHandler.END
+
+
 # - ОТМЕНА --------------------------------------------------------------------
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -689,6 +737,7 @@ async def sync_bot_commands(app: Application):
         BotCommand("setchannel", "Сменить канал"),
         BotCommand("customtexts", "Настроить свои тексты"),
         BotCommand("resettexts", "Вернуть стандартные тексты"),
+        BotCommand("reset", "Сбросить всё и начать заново"),
         BotCommand("status", "Текущие настройки"),
         BotCommand("help", "Справка"),
     ])
@@ -750,10 +799,22 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    # Диалог для /reset (с подтверждением)
+    reset_handler = ConversationHandler(
+        entry_points=[CommandHandler("reset", reset_start)],
+        states={
+            WAITING_FOR_RESET_CONFIRM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, reset_confirm)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(channel_handler)
     app.add_handler(freq_handler)
     app.add_handler(checkin_handler)
     app.add_handler(customtexts_handler)
+    app.add_handler(reset_handler)
     app.add_handler(CommandHandler("status",         status))
     app.add_handler(CommandHandler("ask",            set_mode_ask))
     app.add_handler(CommandHandler("autopost",       set_mode_autopost))
