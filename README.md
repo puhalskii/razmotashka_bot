@@ -196,11 +196,3 @@ sudo bash /opt/bike_crash_bot/uninstall.sh --purge
 /etc/systemd/system/
   bike_crash_bot.service - systemd сервис
 ```
-
----
-
-## Сосуществование с другими сервисами
-
-Бот не занимает никаких портов и не конфликтует с xl2tpd, AdGuard Home
-и другими системными сервисами. Работает изолированно через systemd
-под отдельным пользователем bike_bot.

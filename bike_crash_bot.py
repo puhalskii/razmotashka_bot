@@ -11,7 +11,7 @@ import os
 import logging
 import sqlite3
 from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
@@ -672,13 +672,35 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Необработанная ошибка при обновлении {update}: {context.error}", exc_info=context.error)
 
 
+# - СИНХРОНИЗАЦИЯ МЕНЮ КОМАНД --------------------------------------------------
+
+async def sync_bot_commands(app: Application):
+    """Перезаписывает список команд в Telegram, чтобы меню бота не расходилось с кодом
+    (иначе старые команды из прошлых версий остаются висеть в меню как нерабочие кнопки)."""
+    await app.bot.set_my_commands([
+        BotCommand("start", "Регистрация / главное меню"),
+        BotCommand("ask", "Режим опроса"),
+        BotCommand("autopost", "Режим автопоста"),
+        BotCommand("start_autopost", "Запустить автопост"),
+        BotCommand("stop_autopost", "Остановить автопост"),
+        BotCommand("setfreq", "Задать частоту проверок"),
+        BotCommand("checkin", "Ручной чекин"),
+        BotCommand("crashed", "Зафиксировать падение"),
+        BotCommand("setchannel", "Сменить канал"),
+        BotCommand("customtexts", "Настроить свои тексты"),
+        BotCommand("resettexts", "Вернуть стандартные тексты"),
+        BotCommand("status", "Текущие настройки"),
+        BotCommand("help", "Справка"),
+    ])
+
+
 # - ЗАПУСК --------------------------------------------------------------------
 
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан! Установи переменную окружения BOT_TOKEN.")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(sync_bot_commands).build()
 
     # Онбординг и смена канала
     channel_handler = ConversationHandler(
