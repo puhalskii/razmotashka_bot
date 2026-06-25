@@ -238,8 +238,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         running = "запущен ✅" if user["running"] else "остановлен ⏸"
         await update.message.reply_text(
             "👋 Трекер разматывания на Мотике!\n\n"
-            f"Канал: `{user['channel_id']}`\n"
-            f"Режим: *{mode}* | Частота: *{freq}* | Статус: *{running}*\n\n"
+            f"Канал: <code>{user['channel_id']}</code>\n"
+            f"Режим: <b>{mode}</b> | Частота: <b>{freq}</b> | Статус: <b>{running}</b>\n\n"
             "Команды:\n"
             "/ask - режим опроса\n"
             "/autopost - режим автопоста\n"
@@ -253,7 +253,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/customtexts - свои тексты вместо темы «Размотался»\n"
             "/reset - сбросить всё и начать заново\n"
             "/help - справка",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return ConversationHandler.END
     else:
