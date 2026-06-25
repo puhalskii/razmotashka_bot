@@ -2,7 +2,7 @@
 # Установка Bike Crash Tracker Bot на Debian
 # Скрипт сам скачивает всё необходимое с GitHub - локальная копия репозитория не нужна.
 # Использование:
-#   curl -fsSL https://raw.githubusercontent.com/puhalskii/razmotashka_bot/main/install.sh | sudo bash
+#   sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/puhalskii/razmotashka_bot/main/install.sh)"
 set -e
 
 REPO_RAW_BASE="https://raw.githubusercontent.com/puhalskii/razmotashka_bot/main"
@@ -24,7 +24,7 @@ apt-get install -y python3 python3-venv python3-pip curl
 echo "[2/7] Настройка токена бота..."
 echo "Создай бота у @BotFather в Telegram и возьми у него токен."
 while true; do
-    read -s -p "Вставь токен бота: " BOT_TOKEN
+    read -s -p "Вставь токен бота: " BOT_TOKEN < /dev/tty
     echo
     if [ -z "$BOT_TOKEN" ]; then
         echo "Токен не может быть пустым, попробуй ещё раз."

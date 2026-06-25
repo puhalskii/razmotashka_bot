@@ -39,7 +39,7 @@ if [ -d /var/lib/bike_crash_bot ]; then
         rm -rf /var/lib/bike_crash_bot
         echo "  Удалена (--purge)."
     else
-        read -p "  Удалить базу данных со всеми пользователями? [y/N] " answer
+        read -p "  Удалить базу данных со всеми пользователями? [y/N] " answer < /dev/tty
         if [[ "$answer" =~ ^[Yy]$ ]]; then
             rm -rf /var/lib/bike_crash_bot
             echo "  Удалена."
@@ -57,7 +57,7 @@ if id "bike_bot" &>/dev/null; then
         userdel bike_bot 2>/dev/null || true
         echo "Системный пользователь bike_bot удалён (--purge)."
     else
-        read -p "Удалить системного пользователя bike_bot? [y/N] " answer
+        read -p "Удалить системного пользователя bike_bot? [y/N] " answer < /dev/tty
         if [[ "$answer" =~ ^[Yy]$ ]]; then
             userdel bike_bot 2>/dev/null || true
             echo "Пользователь bike_bot удалён."

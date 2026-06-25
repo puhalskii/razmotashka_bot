@@ -58,7 +58,7 @@
 Скрипт сам скачивает всё необходимое с GitHub - клонировать репозиторий не нужно.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/puhalskii/razmotashka_bot/main/install.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/puhalskii/razmotashka_bot/main/install.sh)"
 ```
 
 Скрипт спросит токен бота от @BotFather, проверит его через Telegram API,
