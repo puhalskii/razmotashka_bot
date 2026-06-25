@@ -5,13 +5,19 @@ After=network.target
 [Service]
 Type=simple
 User=bike_bot
-Group=bike_bot
 WorkingDirectory=/opt/bike_crash_bot
-Environment=BOT_TOKEN=1234567890:AAFxxxxxxxxxxxxxxxxxxxxx
-Environment=DB_PATH=/var/lib/bike_crash_bot/state.db
-ExecStart=/opt/bike_crash_bot/venv/bin/python /opt/bike_crash_bot/bike_crash_bot.py
-Restart=on-failure
+ExecStart=/opt/bike_crash_bot/venv/bin/python bike_crash_bot.py
+Restart=always
 RestartSec=10
+
+# - Переменные окружения ------------------------------------------------------
+Environment=BOT_TOKEN=сюда_токен_от_botfather
+Environment=DB_PATH=/var/lib/bike_crash_bot/state.db
+
+# - Логи ----------------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bike_crash_bot
 
 [Install]
 WantedBy=multi-user.target

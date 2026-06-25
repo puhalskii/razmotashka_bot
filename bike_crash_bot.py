@@ -1,10 +1,10 @@
 """
-Трекер разматывания на мотике - Мультипользовательская версия
-- Поддержка нескольких пользователей с индивидуальными настройками
-- Онбординг при /start с проверкой прав на канал
-- Каждый пользователь работает со своим каналом
-- Индивидуальные задания в планировщике для каждого пользователя
-- Возможность поставить постинг на паузу (/pause) и возобновить (/resume)
+Трекер разматывания на мотике - мульти-юзер версия
+- Каждый пользователь регистрирует свой канал
+- Режим 1: спрашивает по расписанию, ждёт ответа
+- Режим 2: постит сам по расписанию пока не остановишь или не скажешь что размотался
+- Удаляет предыдущее сообщение в канале перед новым постом
+- Хранит состояние каждого пользователя в SQLite
 """
 
 import os
@@ -17,15 +17,14 @@ from telegram.ext import (
     filters, ContextTypes, ConversationHandler
 )
 
-# - НАСТРОЙКИ (через переменные окружения) ------------------------------------
+# - НАСТРОЙКИ -----------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-DB_PATH = os.environ.get("DB_PATH", "/var/lib/bike_crash_bot/state.db")
+DB_PATH   = os.environ.get("DB_PATH", "/var/lib/bike_crash_bot/state.db")
 
-# - СОСТОЯНИЯ ДИАЛОГА ---------------------------------------------------------
-WAITING_FOR_CHANNEL = 1
-WAITING_FOR_ANSWER = 2
-WAITING_FOR_FREQ = 3
-WAITING_FOR_CHECK = 4
+# - СОСТОЯНИЯ ДИАЛОГОВ --------------------------------------------------------
+WAITING_FOR_CHANNEL = 10
+WAITING_FOR_FREQ    = 20
+WAITING_FOR_CHECK   = 30
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -40,413 +39,288 @@ def db_connect():
     """Открывает соединение с БД, создаёт таблицу если нет."""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id      INTEGER PRIMARY KEY,
-            channel_id   TEXT,
-            mode         INTEGER DEFAULT 1,
-            freq         TEXT DEFAULT '7d',
-            running      INTEGER DEFAULT 0,
-            paused       INTEGER DEFAULT 0,
-            last_msg_id  TEXT,
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            user_id    INTEGER PRIMARY KEY,
+            channel_id TEXT,
+            mode       INTEGER DEFAULT 1,
+            freq       TEXT    DEFAULT '7d',
+            running    INTEGER DEFAULT 0,
+            last_msg_id INTEGER
         )
     """)
     conn.commit()
     return conn
 
-def get_user(user_id):
-    """Получает настройки пользователя."""
+def user_get(user_id):
+    """Возвращает строку пользователя или None."""
     with db_connect() as conn:
-        row = conn.execute(
-            "SELECT channel_id, mode, freq, running, paused, last_msg_id FROM users WHERE user_id=?",
-            (user_id,)
-        ).fetchone()
-        if row:
-            return {
-                "channel_id": row[0],
-                "mode": row[1],
-                "freq": row[2],
-                "running": row[3],
-                "paused": row[4],
-                "last_msg_id": row[5]
-            }
-        return None
+        row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return dict(row) if row else None
 
-def create_user(user_id):
-    """Создаёт нового пользователя."""
+def user_set(user_id, **kwargs):
+    """Создаёт или обновляет поля пользователя."""
     with db_connect() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-            (user_id,)
-        )
+        existing = conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if existing:
+            fields = ", ".join(f"{k}=?" for k in kwargs)
+            conn.execute(f"UPDATE users SET {fields} WHERE user_id=?", (*kwargs.values(), user_id))
+        else:
+            kwargs["user_id"] = user_id
+            fields  = ", ".join(kwargs.keys())
+            placeholders = ", ".join("?" for _ in kwargs)
+            conn.execute(f"INSERT INTO users ({fields}) VALUES ({placeholders})", list(kwargs.values()))
         conn.commit()
 
-def update_user(user_id, **kwargs):
-    """Обновляет настройки пользователя."""
+def all_users():
+    """Возвращает всех пользователей."""
     with db_connect() as conn:
-        for key, value in kwargs.items():
-            conn.execute(
-                f"UPDATE users SET {key}=? WHERE user_id=?",
-                (value, user_id)
-            )
-        conn.commit()
-
-def delete_user(user_id):
-    """Удаляет пользователя."""
-    with db_connect() as conn:
-        conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-        conn.commit()
-
-def get_all_users():
-    """Возвращает список всех user_id."""
-    with db_connect() as conn:
-        rows = conn.execute("SELECT user_id FROM users").fetchall()
-        return [row[0] for row in rows]
+        return [dict(r) for r in conn.execute("SELECT * FROM users").fetchall()]
 
 
 # - ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---------------------------------------------------
 
-def get_mode(user_id):
-    """Возвращает текущий режим пользователя: 1 или 2."""
-    user = get_user(user_id)
-    return user["mode"] if user else 1
-
-def get_freq_seconds(user_id):
-    """Возвращает частоту опроса в секундах."""
-    user = get_user(user_id)
-    freq = user["freq"] if user else "7d"
+def freq_to_seconds(freq):
+    """Переводит строку частоты в секунды."""
     unit = freq[-1]
-    val = int(freq[:-1])
+    val  = int(freq[:-1])
     if unit == "h": return val * 3600
     if unit == "d": return val * 86400
     if unit == "w": return val * 604800
     return 604800
 
-def get_freq_label(user_id):
+def freq_to_label(freq):
     """Возвращает читаемую строку частоты."""
-    user = get_user(user_id)
-    freq = user["freq"] if user else "7d"
-    unit = freq[-1]
-    val = int(freq[:-1])
+    unit   = freq[-1]
+    val    = int(freq[:-1])
     labels = {"h": "ч", "d": "д", "w": "нед"}
     return f"каждые {val} {labels.get(unit, '?')}"
 
-def is_running(user_id):
-    """Режим 2 активен?"""
-    user = get_user(user_id)
-    return user["running"] == 1 if user else False
+def job_name(user_id):
+    """Имя задания планировщика для пользователя."""
+    return f"job_{user_id}"
 
-def is_paused(user_id):
-    """Постинг на паузе?"""
-    user = get_user(user_id)
-    return user["paused"] == 1 if user else False
-
-async def delete_last_channel_message(bot, user_id, channel_id):
-    """Удаляет предыдущее сообщение бота в канале если есть."""
-    user = get_user(user_id)
-    last_id = user["last_msg_id"] if user else None
-    if last_id:
+async def delete_last_message(bot, user):
+    """Удаляет последнее сообщение бота в канале пользователя."""
+    if user.get("last_msg_id") and user.get("channel_id"):
         try:
-            await bot.delete_message(chat_id=channel_id, message_id=int(last_id))
-        except Exception as e:
-            logger.warning(f"Не смог удалить сообщение {last_id} для {user_id}: {e}")
-
-async def post_to_channel(bot, user_id, channel_id, text):
-    """Удаляет старое сообщение и постит новое, сохраняет message_id."""
-    await delete_last_channel_message(bot, user_id, channel_id)
-    try:
-        msg = await bot.send_message(chat_id=channel_id, text=text)
-        update_user(user_id, last_msg_id=str(msg.message_id))
-        logger.info(f"Запостил в канал для {user_id}: {text}")
-        return True
-    except Exception as e:
-        logger.error(f"Ошибка отправки в канал для {user_id}: {e}")
-        return False
-
-
-# - ЗАДАНИЯ ПО РАСПИСАНИЮ -----------------------------------------------------
-
-async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
-    """Основное задание по расписанию - режим 1 или 2."""
-    user_id = context.job.data["user_id"]
-    user = get_user(user_id)
-    if not user:
-        # Пользователь удалён, удаляем задание
-        context.job.schedule_removal()
-        return
-
-    # Проверка паузы - если на паузе, ничего не делаем
-    if user["paused"] == 1:
-        return
-
-    mode = user["mode"]
-    channel_id = user["channel_id"]
-    today = datetime.now().strftime("%d.%m.%Y")
-
-    if mode == 1:
-        # Режим 1 - спрашиваем
-        keyboard = [["Неа 🚴", "Ага 💥"]]
-        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="🏍️ *Плановая проверка!*\n\nРазмотался, дурак?",
-                parse_mode="Markdown",
-                reply_markup=reply_markup,
+            await bot.delete_message(
+                chat_id=user["channel_id"],
+                message_id=user["last_msg_id"]
             )
         except Exception as e:
-            logger.error(f"Не удалось отправить сообщение {user_id}: {e}")
-    elif mode == 2 and user["running"] == 1:
-        # Режим 2 - постим сами без вопросов
+            logger.warning(f"Не смог удалить сообщение у {user['user_id']}: {e}")
+
+async def post_to_channel(bot, user, text):
+    """Удаляет старое сообщение и постит новое."""
+    await delete_last_message(bot, user)
+    msg = await bot.send_message(chat_id=user["channel_id"], text=text)
+    user_set(user["user_id"], last_msg_id=msg.message_id)
+    logger.info(f"[{user['user_id']}] Запостил в канал: {text}")
+
+def is_registered(user):
+    """Пользователь зарегистрирован и канал задан?"""
+    return user and user.get("channel_id")
+
+
+# - ПЛАНИРОВЩИК ---------------------------------------------------------------
+
+async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
+    """Задание по расписанию для одного пользователя."""
+    user_id = context.job.data
+    user    = user_get(user_id)
+    if not user or not user.get("channel_id"):
+        return
+
+    today = datetime.now().strftime("%d.%m.%Y")
+
+    if user["mode"] == 1:
+        # Режим опроса - спрашиваем
+        keyboard     = [["Неа 🚴", "Ага 💥"]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="Эй! 🏍️ Плановая проверка:\n\n*Размотался, дурак?*",
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+        )
+    elif user["mode"] == 2 and user["running"]:
+        # Режим автопоста - постим сами
         await post_to_channel(
-            context.bot,
-            user_id,
-            channel_id,
+            context.bot, user,
             f"📅 {today}: всё ещё не размотался 🚴✅"
         )
 
-def schedule_for_user(app, user_id):
-    """Создаёт или обновляет задание для пользователя."""
-    # Удаляем старое задание если есть
-    for job in app.job_queue.jobs():
-        if job.data and job.data.get("user_id") == user_id:
-            job.schedule_removal()
-
-    user = get_user(user_id)
-    if not user or not user["channel_id"]:
-        return
-
-    # Если пауза - не создаём задание
-    if user["paused"] == 1:
-        return
-
-    # В режиме 2 если running=0 - не создаём задание
-    if user["mode"] == 2 and user["running"] == 0:
-        return
-
-    interval = get_freq_seconds(user_id)
+def reschedule_user(app, user_id, freq):
+    """Перепланирует задание пользователя с новой частотой."""
+    # Удаляем старое задание
+    for job in app.job_queue.get_jobs_by_name(job_name(user_id)):
+        job.schedule_removal()
+    # Создаём новое
     app.job_queue.run_repeating(
         scheduled_job,
-        interval=interval,
+        interval=freq_to_seconds(freq),
         first=10,
-        name=f"user_{user_id}",
-        data={"user_id": user_id}
+        name=job_name(user_id),
+        data=user_id
     )
-    logger.info(f"Задание для {user_id} запланировано: {get_freq_label(user_id)}")
+    logger.info(f"[{user_id}] Задание запланировано: {freq_to_label(freq)}")
 
-async def reschedule_all(app):
-    """Перепланирует все задания для всех пользователей."""
-    # Удаляем все задания
-    for job in app.job_queue.jobs():
-        job.schedule_removal()
-
-    # Создаём заново для всех пользователей
-    for user_id in get_all_users():
-        schedule_for_user(app, user_id)
+def restore_jobs(app):
+    """Восстанавливает задания для всех пользователей при старте."""
+    for user in all_users():
+        reschedule_user(app, user["user_id"], user["freq"])
+    logger.info(f"Восстановлено заданий: {len(all_users())}")
 
 
 # - ОНБОРДИНГ /start ----------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало работы - онбординг с проверкой канала."""
     user_id = update.effective_user.id
-    
-    # Создаём пользователя если его нет
-    create_user(user_id)
-    user = get_user(user_id)
-    
-    # Если уже есть канал - показываем меню
-    if user["channel_id"]:
-        await show_main_menu(update, context, user_id)
-        return ConversationHandler.END
-    
-    # Запрашиваем канал
-    await update.message.reply_text(
-        "👋 *Привет! Я бот для трекинга разматывания на мотике.*\n\n"
-        "Для начала работы мне нужен канал, куда я буду постить результаты.\n\n"
-        "**Важно:** Бот должен быть добавлен как *администратор* в этот канал "
-        "(даже если канал публичный).\n\n"
-        "Отправь мне название канала:\n"
-        "• Для публичного: `@имя_канала`\n"
-        "• Для приватного: числовой ID канала (узнать у @userinfobot)",
-        parse_mode="Markdown"
-    )
-    return WAITING_FOR_CHANNEL
+    user    = user_get(user_id)
 
-async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ввод канала и проверяет доступ."""
-    user_id = update.effective_user.id
-    channel_input = update.message.text.strip()
-    
-    # Проверяем, что бот может постить в канал
-    try:
-        # Пробуем отправить тестовое сообщение
-        test_msg = await context.bot.send_message(
-            chat_id=channel_input,
-            text="✅ Бот успешно подключён к каналу!"
-        )
-        # Удаляем тестовое сообщение
-        await context.bot.delete_message(
-            chat_id=channel_input,
-            message_id=test_msg.message_id
-        )
-        
-        # Сохраняем канал
-        update_user(user_id, channel_id=channel_input)
-        
+    if is_registered(user):
+        # Уже зарегистрирован - показываем меню
+        freq    = freq_to_label(user["freq"])
+        mode    = "опрос" if user["mode"] == 1 else "автопост"
+        running = "запущен ✅" if user["running"] else "остановлен ⏸"
         await update.message.reply_text(
-            f"✅ Канал успешно подключён!\n\n"
-            "Теперь настроим частоту проверок.\n"
-            "По умолчанию: раз в неделю (7d).\n\n"
-            "Ты можешь изменить частоту позже командой /setfreq",
-            reply_markup=ReplyKeyboardRemove()
+            "👋 Трекер разматывания на Мотике!\n\n"
+            f"Канал: `{user['channel_id']}`\n"
+            f"Режим: *{mode}* | Частота: *{freq}* | Статус: *{running}*\n\n"
+            "Команды:\n"
+            "/ask - режим опроса\n"
+            "/autopost - режим автопоста\n"
+            "/setfreq - задать частоту опроса/автопоста\n"
+            "/start_autopost - запустить автопост\n"
+            "/stop_autopost - остановить автопост\n"
+            "/crashed - зафиксировать падение\n"
+            "/checkin - ручной чекин\n"
+            "/status - текущие настройки\n"
+            "/setchannel - сменить канал\n"
+            "/help - справка",
+            parse_mode="Markdown"
         )
-        
-        # Показываем главное меню
-        await show_main_menu(update, context, user_id)
         return ConversationHandler.END
-        
-    except Exception as e:
-        logger.error(f"Ошибка проверки канала для {user_id}: {e}")
+    else:
+        # Новый пользователь - запускаем онбординг
         await update.message.reply_text(
-            "❌ Не удалось отправить сообщение в канал.\n\n"
-            "Убедись, что:\n"
-            "1. Бот добавлен в канал как администратор\n"
-            "2. Название канала введено правильно\n"
-            "3. Канал существует\n\n"
-            "Попробуй ещё раз или напиши /cancel для отмены."
+            "👋 Привет! Это трекер разматывания на мотике.\n\n"
+            "Бот будет спрашивать тебя — размотался или нет — и постить результат в твой Telegram-канал.\n\n"
+            "Для начала:\n"
+            "1. Создай канал в Telegram\n"
+            "2. Добавь этого бота администратором канала\n"
+            "3. Пришли мне username канала или его ID\n\n"
+            "Пример: `@mycannel` или `-1001234567890`",
+            parse_mode="Markdown"
         )
         return WAITING_FOR_CHANNEL
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id=None):
-    """Показывает главное меню."""
-    if user_id is None:
-        user_id = update.effective_user.id
-    
-    user = get_user(user_id)
-    if not user:
-        await update.message.reply_text("Начни с /start")
-        return
-    
-    mode = user["mode"]
-    freq = get_freq_label(user_id)
-    running = "запущен ✅" if user["running"] == 1 else "остановлен ⏸"
-    paused = "приостановлен ⏸" if user["paused"] == 1 else "активен ▶️"
-    channel = user["channel_id"]
-    
-    message = (
-        f"👋 *Трекер разматывания на Мотике!*\n\n"
-        f"📌 Канал: `{channel}`\n"
-        f"📊 Режим: *{mode}*\n"
-        f"⏱ Частота: *{freq}*\n"
-        f"▶️ Автопост: *{running}*\n"
-        f"⏸ Статус: *{paused}*\n\n"
-        "*Команды:*\n"
-        "/ask - режим опроса\n"
-        "/autopost - режим автопоста\n"
-        "/setfreq - задать частоту\n"
-        "/start_autopost - запустить автопост\n"
-        "/stop_autopost - остановить автопост\n"
-        "/pause - приостановить все посты\n"
-        "/resume - возобновить посты\n"
-        "/crashed - зафиксировать падение\n"
-        "/checkin - ручной чекин\n"
-        "/status - текущие настройки\n"
-        "/reset - сбросить настройки\n"
-        "/help - справка"
-    )
-    
-    if update and update.message:
-        await update.message.reply_text(message, parse_mode="Markdown")
-    else:
-        # Для внутреннего вызова
-        await context.bot.send_message(chat_id=user_id, text=message, parse_mode="Markdown")
+async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает channel_id от пользователя и проверяет доступ."""
+    user_id    = update.effective_user.id
+    channel_id = update.message.text.strip()
 
+    # Нормализуем - добавляем @ если нет и не числовой ID
+    if not channel_id.startswith("@") and not channel_id.lstrip("-").isdigit():
+        channel_id = "@" + channel_id
 
-# - КОМАНДА /reset ------------------------------------------------------------
+    # Проверяем что бот может постить в канал
+    await update.message.reply_text("Проверяю доступ к каналу...")
+    try:
+        test_msg = await context.bot.send_message(
+            chat_id=channel_id,
+            text="🔧 Проверка подключения... сейчас удалю это сообщение."
+        )
+        await context.bot.delete_message(chat_id=channel_id, message_id=test_msg.message_id)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Не могу написать в канал `{channel_id}`.\n\n"
+            "Убедись что:\n"
+            "- Канал существует\n"
+            "- Бот добавлен администратором с правом постить сообщения\n\n"
+            "Попробуй снова:",
+            parse_mode="Markdown"
+        )
+        return WAITING_FOR_CHANNEL
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сбрасывает настройки пользователя."""
-    user_id = update.effective_user.id
-    update_user(user_id, channel_id=None, mode=1, freq="7d", running=0, paused=0, last_msg_id=None)
-    
-    # Удаляем задание
-    for job in context.application.job_queue.jobs():
-        if job.data and job.data.get("user_id") == user_id:
-            job.schedule_removal()
-    
+    # Сохраняем и запускаем задание
+    user_set(user_id, channel_id=channel_id)
+    reschedule_user(context.application, user_id, "7d")
+
     await update.message.reply_text(
-        "🔄 Настройки сброшены. Начни заново с /start",
-        reply_markup=ReplyKeyboardRemove()
+        f"✅ Канал `{channel_id}` подключён!\n\n"
+        "По умолчанию стоит режим опроса раз в 7 дней.\n"
+        "Используй /setfreq чтобы изменить частоту.\n\n"
+        "/help - список всех команд",
+        parse_mode="Markdown"
     )
+    return ConversationHandler.END
+
+
+# - КОМАНДА /setchannel -------------------------------------------------------
+
+async def setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Пришли новый username или ID канала.\n"
+        "Пример: `@mycannel` или `-1001234567890`\n\n"
+        "Не забудь что бот должен быть администратором нового канала.",
+        parse_mode="Markdown"
+    )
+    return WAITING_FOR_CHANNEL
 
 
 # - КОМАНДА /status -----------------------------------------------------------
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает текущий статус пользователя."""
     user_id = update.effective_user.id
-    user = get_user(user_id)
-    
-    if not user or not user["channel_id"]:
-        await update.message.reply_text("Сначала настрой бота через /start")
+    user    = user_get(user_id)
+    if not is_registered(user):
+        await update.message.reply_text("Сначала зарегистрируйся командой /start")
         return
-    
-    mode = user["mode"]
-    freq = get_freq_label(user_id)
-    running = "запущен ✅" if user["running"] == 1 else "остановлен ⏸"
-    paused = "приостановлен ⏸" if user["paused"] == 1 else "активен ▶️"
+
+    mode    = "опрос" if user["mode"] == 1 else "автопост"
+    freq    = freq_to_label(user["freq"])
+    running = "запущен ✅" if user["running"] else "остановлен ⏸"
     last_id = user["last_msg_id"] or "нет"
-    channel = user["channel_id"]
-    
+
     await update.message.reply_text(
-        f"📊 *Текущий статус*\n\n"
-        f"👤 ID: `{user_id}`\n"
-        f"📌 Канал: `{channel}`\n"
-        f"📊 Режим: *{mode}*\n"
-        f"⏱ Частота: *{freq}*\n"
-        f"▶️ Автопост: *{running}*\n"
-        f"⏸ Пауза: *{paused}*\n"
-        f"📨 Последнее сообщение: `{last_id}`",
+        f"📊 Статус:\n\n"
+        f"Канал: `{user['channel_id']}`\n"
+        f"Режим: *{mode}*\n"
+        f"Частота: *{freq}*\n"
+        f"Автопост: *{running}*\n"
+        f"Последнее сообщение в канале: `{last_id}`",
         parse_mode="Markdown"
     )
 
 
 # - КОМАНДА /ask --------------------------------------------------------------
 
-async def set_mode1(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Включает режим опроса."""
+async def set_mode_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user = get_user(user_id)
-    
-    if not user or not user["channel_id"]:
-        await update.message.reply_text("Сначала настрой бота через /start")
+    user    = user_get(user_id)
+    if not is_registered(user):
+        await update.message.reply_text("Сначала зарегистрируйся командой /start")
         return
-    
-    update_user(user_id, mode=1, running=0)
-    # Перепланируем задание
-    schedule_for_user(context.application, user_id)
-    
+    user_set(user_id, mode=1, running=0)
+    reschedule_user(context.application, user_id, user["freq"])
     await update.message.reply_text(
-        f"✅ Режим опроса включён.\n"
-        f"Буду спрашивать тебя {get_freq_label(user_id)}."
+        "✅ Режим опроса включён.\n"
+        f"Буду спрашивать тебя {freq_to_label(user['freq'])}."
     )
 
 
 # - КОМАНДА /autopost ---------------------------------------------------------
 
-async def set_mode2(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Включает режим автопоста."""
+async def set_mode_autopost(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user = get_user(user_id)
-    
-    if not user or not user["channel_id"]:
-        await update.message.reply_text("Сначала настрой бота через /start")
+    user    = user_get(user_id)
+    if not is_registered(user):
+        await update.message.reply_text("Сначала зарегистрируйся командой /start")
         return
-    
-    update_user(user_id, mode=2)
-    
+    user_set(user_id, mode=2)
     await update.message.reply_text(
         "✅ Режим автопоста включён.\n"
         "Буду постить в канал сам без вопросов.\n"
@@ -457,24 +331,18 @@ async def set_mode2(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # - КОМАНДА /start_autopost ---------------------------------------------------
 
 async def start_autopost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запускает автопост."""
     user_id = update.effective_user.id
-    user = get_user(user_id)
-    
-    if not user or not user["channel_id"]:
-        await update.message.reply_text("Сначала настрой бота через /start")
+    user    = user_get(user_id)
+    if not is_registered(user):
+        await update.message.reply_text("Сначала зарегистрируйся командой /start")
         return
-    
     if user["mode"] != 2:
         await update.message.reply_text("Сначала переключись в режим автопоста командой /autopost")
         return
-    
-    update_user(user_id, running=1)
-    # Перепланируем задание
-    schedule_for_user(context.application, user_id)
-    
+    user_set(user_id, running=1)
+    reschedule_user(context.application, user_id, user["freq"])
     await update.message.reply_text(
-        f"▶️ Автопост запущен! Постю {get_freq_label(user_id)}.\n"
+        f"▶️ Автопост запущен! Постю {freq_to_label(user['freq'])}.\n"
         "Останови через /stop_autopost или зафиксируй падение через /crashed."
     )
 
@@ -482,122 +350,45 @@ async def start_autopost(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # - КОМАНДА /stop_autopost ----------------------------------------------------
 
 async def stop_autopost(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Останавливает автопост."""
     user_id = update.effective_user.id
-    update_user(user_id, running=0)
-    
-    # Удаляем задание
-    for job in context.application.job_queue.jobs():
-        if job.data and job.data.get("user_id") == user_id:
-            job.schedule_removal()
-    
+    if not is_registered(user_get(user_id)):
+        await update.message.reply_text("Сначала зарегистрируйся командой /start")
+        return
+    user_set(user_id, running=0)
     await update.message.reply_text("⏸ Автопост остановлен.")
-
-
-# - КОМАНДА /pause ------------------------------------------------------------
-
-async def pause_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Приостанавливает все посты (и опрос, и автопост)."""
-    user_id = update.effective_user.id
-    user = get_user(user_id)
-    
-    if not user or not user["channel_id"]:
-        await update.message.reply_text("Сначала настрой бота через /start")
-        return
-    
-    if user["paused"] == 1:
-        await update.message.reply_text("⏸ Посты уже приостановлены.")
-        return
-    
-    update_user(user_id, paused=1)
-    # Удаляем задание
-    for job in context.application.job_queue.jobs():
-        if job.data and job.data.get("user_id") == user_id:
-            job.schedule_removal()
-    
-    await update.message.reply_text(
-        "⏸ *Все посты приостановлены.*\n"
-        "Бот не будет ничего спрашивать и постить.\n"
-        "Чтобы возобновить, используй /resume.",
-        parse_mode="Markdown"
-    )
-
-
-# - КОМАНДА /resume -----------------------------------------------------------
-
-async def resume_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Возобновляет все посты."""
-    user_id = update.effective_user.id
-    user = get_user(user_id)
-    
-    if not user or not user["channel_id"]:
-        await update.message.reply_text("Сначала настрой бота через /start")
-        return
-    
-    if user["paused"] == 0:
-        await update.message.reply_text("▶️ Посты уже активны.")
-        return
-    
-    update_user(user_id, paused=0)
-    # Создаём задание заново
-    schedule_for_user(context.application, user_id)
-    
-    await update.message.reply_text(
-        "▶️ *Посты возобновлены.*\n"
-        f"Бот снова работает в режиме *{user['mode']}* с частотой {get_freq_label(user_id)}.",
-        parse_mode="Markdown"
-    )
 
 
 # - КОМАНДА /setfreq ----------------------------------------------------------
 
 async def setfreq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начинает диалог установки частоты."""
     user_id = update.effective_user.id
-    user = get_user(user_id)
-    
-    if not user or not user["channel_id"]:
-        await update.message.reply_text("Сначала настрой бота через /start")
+    if not is_registered(user_get(user_id)):
+        await update.message.reply_text("Сначала зарегистрируйся командой /start")
         return
-    
-    keyboard = [["1h", "6h", "12h"], ["1d", "3d", "7d"], ["14d", "1w", "2w"]]
+    keyboard     = [["1d", "3d", "7d"], ["14d", "1w", "2w"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-    
     await update.message.reply_text(
-        "⏱ *Настройка частоты*\n\n"
-        "Выбери или напиши своё значение:\n"
-        "• `1h` - каждый час\n"
-        "• `6h` - каждые 6 часов\n"
-        "• `1d` - каждый день\n"
-        "• `3d` - каждые 3 дня\n"
-        "• `7d` - каждую неделю\n"
-        "• `2w` - каждые 2 недели",
+        "Выбери частоту или напиши своё значение:\n"
+        "Форматы: `1h` (час), `3d` (дня), `1w` (неделя)",
         parse_mode="Markdown",
         reply_markup=reply_markup
     )
     return WAITING_FOR_FREQ
 
 async def handle_freq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ввод частоты."""
     user_id = update.effective_user.id
-    text = update.message.text.strip().lower()
-    
-    # Валидация формата
+    text    = update.message.text.strip().lower()
     if len(text) < 2 or text[-1] not in ("h", "d", "w") or not text[:-1].isdigit():
         await update.message.reply_text(
-            "❌ Неверный формат. Примеры: `1h`, `3d`, `7d`, `2w`",
+            "Неверный формат. Примеры: `1h`, `3d`, `7d`, `2w`",
             parse_mode="Markdown",
             reply_markup=ReplyKeyboardRemove()
         )
         return WAITING_FOR_FREQ
-    
-    update_user(user_id, freq=text)
-    
-    # Перепланируем задание
-    schedule_for_user(context.application, user_id)
-    
+    user_set(user_id, freq=text)
+    reschedule_user(context.application, user_id, text)
     await update.message.reply_text(
-        f"✅ Частота установлена: {get_freq_label(user_id)}",
+        f"✅ Частота установлена: {freq_to_label(text)}",
         reply_markup=ReplyKeyboardRemove()
     )
     return ConversationHandler.END
@@ -606,175 +397,126 @@ async def handle_freq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # - КОМАНДА /checkin ----------------------------------------------------------
 
 async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручной чекин."""
     user_id = update.effective_user.id
-    user = get_user(user_id)
-    
-    if not user or not user["channel_id"]:
-        await update.message.reply_text("Сначала настрой бота через /start")
+    if not is_registered(user_get(user_id)):
+        await update.message.reply_text("Сначала зарегистрируйся командой /start")
         return
-    
-    keyboard = [["Неа 🚴", "Ага 💥"]]
+    keyboard     = [["Неа 🚴", "Ага 💥"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-    
     await update.message.reply_text(
-        "🏍️ *Ручной чекин*\n\n*Размотался? Признавайся.*",
+        "Ручной чекин 🏍️\n\n*Размотался? Признавайся.*",
         parse_mode="Markdown",
         reply_markup=reply_markup,
     )
     return WAITING_FOR_CHECK
 
-async def handle_check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает ответ на ручной чекин."""
+async def handle_checkin_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user = get_user(user_id)
-    
-    if not user or not user["channel_id"]:
-        await update.message.reply_text("Сначала настрой бота через /start")
-        return ConversationHandler.END
-    
-    text = update.message.text
-    today = datetime.now().strftime("%d.%m.%Y")
-    
+    user    = user_get(user_id)
+    text    = update.message.text
+    today   = datetime.now().strftime("%d.%m.%Y")
+
     if "Неа" in text:
-        await post_to_channel(
-            context.bot,
-            user_id,
-            user["channel_id"],
-            f"📅 {today}: всё ещё не размотался 🚴✅"
-        )
+        await post_to_channel(context.bot, user, f"📅 {today}: всё ещё не размотался 🚴✅")
         await update.message.reply_text(
-            "👍 Отправил в канал!",
+            "Шикос, отправил в канал. Пусть завидуют 🎉",
             reply_markup=ReplyKeyboardRemove()
         )
     elif "Ага" in text:
-        await post_to_channel(
-            context.bot,
-            user_id,
-            user["channel_id"],
-            f"📅 {today}: всё-таки размотался 💥"
-        )
-        update_user(user_id, running=0)  # останавливаем автопост если был
+        await post_to_channel(context.bot, user, f"📅 {today}: всё-таки размотался 💥")
+        user_set(user_id, running=0)
         await update.message.reply_text(
-            "💥 Отправил в канал. Автопост остановлен.",
+            "Ну в целом ожидаемо. Отправил в канал пусть посмеются.",
             reply_markup=ReplyKeyboardRemove()
         )
     else:
         await update.message.reply_text(
-            "Тыкай в кнопки!",
+            "Тыкай в кнопки, тупица!",
             reply_markup=ReplyKeyboardRemove()
         )
         return WAITING_FOR_CHECK
-    
+
     return ConversationHandler.END
 
 
 # - КОМАНДА /crashed ----------------------------------------------------------
 
 async def crashed(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Фиксирует падение вручную."""
     user_id = update.effective_user.id
-    user = get_user(user_id)
-    
-    if not user or not user["channel_id"]:
-        await update.message.reply_text("Сначала настрой бота через /start")
+    user    = user_get(user_id)
+    if not is_registered(user):
+        await update.message.reply_text("Сначала зарегистрируйся командой /start")
         return
-    
     today = datetime.now().strftime("%d.%m.%Y")
-    
-    await post_to_channel(
-        context.bot,
-        user_id,
-        user["channel_id"],
-        f"📅 {today}: всё-таки размотался 💥"
-    )
-    update_user(user_id, running=0)
-    
-    # Удаляем задание
-    for job in context.application.job_queue.jobs():
-        if job.data and job.data.get("user_id") == user_id:
-            job.schedule_removal()
-    
+    await post_to_channel(context.bot, user, f"📅 {today}: всё-таки размотался 💥")
+    user_set(user_id, running=0)
     await update.message.reply_text(
-        "💥 Зафиксировал падение. Автопост остановлен.\n"
-        "Надеюсь всё норм 🤕"
+        "💥 Зафиксировал. Автопост остановлен.\n"
+        "Надеюсь всё норм, дурак 🤕"
     )
 
 
 # - КОМАНДА /help -------------------------------------------------------------
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает справку."""
     await update.message.reply_text(
-        "📖 *Справка по боту*\n\n"
-        "*РЕЖИМЫ:*\n"
+        "📖 Справка по боту\n\n"
+        "РЕЖИМЫ:\n"
         "/ask - режим опроса. Бот спрашивает тебя по расписанию,\n"
         "  ты отвечаешь кнопками, он постит в канал.\n"
         "/autopost - режим автопоста. Бот сам постит в канал по\n"
-        "  расписанию без вопросов.\n\n"
-        "*УПРАВЛЕНИЕ:*\n"
+        "  расписанию без вопросов. Останавливается по /stop_autopost\n"
+        "  или /crashed.\n\n"
+        "УПРАВЛЕНИЕ:\n"
         "/start_autopost - запустить автопост\n"
         "/stop_autopost - остановить автопост\n"
-        "/pause - приостановить *все* посты (и опрос, и автопост)\n"
-        "/resume - возобновить посты\n"
         "/crashed - зафиксировать падение и остановить автопост\n"
         "/checkin - ручной чекин с кнопками\n\n"
-        "*НАСТРОЙКИ:*\n"
-        "/setfreq - задать частоту\n"
-        "/status - показать текущие настройки\n"
-        "/reset - сбросить все настройки\n\n"
-        "*ПРОЧЕЕ:*\n"
+        "НАСТРОЙКИ:\n"
+        "/setfreq - задать частоту. Форматы:\n"
+        "  1h = каждый час\n"
+        "  3d = каждые 3 дня\n"
+        "  1w = каждую неделю\n"
+        "/setchannel - сменить канал\n"
+        "/status - показать текущие настройки\n\n"
+        "ПРОЧЕЕ:\n"
         "/start - главное меню\n"
-        "/help - эта справка",
-        parse_mode="Markdown"
+        "/help - эта справка"
     )
-
-
-# - ЛОВИМ КНОПКИ ИЗ ПЛАНИРОВЩИКА ---------------------------------------------
-
-async def catch_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ловит нажатия кнопок из сообщений планировщика вне диалога."""
-    user_id = update.effective_user.id
-    user = get_user(user_id)
-    
-    if not user or not user["channel_id"]:
-        await update.message.reply_text("Сначала настрой бота через /start")
-        return
-    
-    text = update.message.text or ""
-    today = datetime.now().strftime("%d.%m.%Y")
-    
-    if "Неа" in text:
-        await post_to_channel(
-            context.bot,
-            user_id,
-            user["channel_id"],
-            f"📅 {today}: всё ещё не размотался 🚴✅"
-        )
-        await update.message.reply_text(
-            "👍 Отправил в канал!",
-            reply_markup=ReplyKeyboardRemove()
-        )
-    elif "Ага" in text:
-        await post_to_channel(
-            context.bot,
-            user_id,
-            user["channel_id"],
-            f"📅 {today}: всё-таки размотался 💥"
-        )
-        update_user(user_id, running=0)
-        await update.message.reply_text(
-            "💥 Отправил в канал. Автопост остановлен.",
-            reply_markup=ReplyKeyboardRemove()
-        )
 
 
 # - ОТМЕНА --------------------------------------------------------------------
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отменяет текущий диалог."""
     await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
+
+
+# - ЛОВИМ КНОПКИ ИЗ ПЛАНИРОВЩИКА (режим 1) -----------------------------------
+
+async def catch_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит нажатия кнопок из сообщений планировщика вне диалога."""
+    user_id = update.effective_user.id
+    user    = user_get(user_id)
+    if not is_registered(user):
+        return
+
+    text  = update.message.text or ""
+    today = datetime.now().strftime("%d.%m.%Y")
+
+    if "Неа" in text:
+        await post_to_channel(context.bot, user, f"📅 {today}: всё ещё не размотался 🚴✅")
+        await update.message.reply_text(
+            "Шикос, отправил в канал. Пусть завидуют 🎉",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    elif "Ага" in text:
+        await post_to_channel(context.bot, user, f"📅 {today}: всё-таки размотался 💥")
+        user_set(user_id, running=0)
+        await update.message.reply_text(
+            "Ну в целом ожидаемо. Отправил в канал пусть посмеются.",
+            reply_markup=ReplyKeyboardRemove()
+        )
 
 
 # - ЗАПУСК --------------------------------------------------------------------
@@ -782,62 +524,64 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN не задан! Установи переменную окружения BOT_TOKEN.")
-    
+
     app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Диалог онбординга
-    onboarding_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+
+    # Онбординг и смена канала
+    channel_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("start",      start),
+            CommandHandler("setchannel", setchannel),
+        ],
         states={
-            WAITING_FOR_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_input)],
+            WAITING_FOR_CHANNEL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_input)
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-    
+
     # Диалог для /setfreq
     freq_handler = ConversationHandler(
         entry_points=[CommandHandler("setfreq", setfreq)],
         states={
-            WAITING_FOR_FREQ: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_freq)],
+            WAITING_FOR_FREQ: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_freq)
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-    
+
     # Диалог для /checkin
-    check_handler = ConversationHandler(
+    checkin_handler = ConversationHandler(
         entry_points=[CommandHandler("checkin", checkin)],
         states={
-            WAITING_FOR_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_check_answer)],
+            WAITING_FOR_CHECK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_checkin_answer)
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
-    
-    app.add_handler(onboarding_handler)
+
+    app.add_handler(channel_handler)
     app.add_handler(freq_handler)
-    app.add_handler(check_handler)
-    
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("ask", set_mode1))
-    app.add_handler(CommandHandler("autopost", set_mode2))
+    app.add_handler(checkin_handler)
+    app.add_handler(CommandHandler("status",         status))
+    app.add_handler(CommandHandler("ask",            set_mode_ask))
+    app.add_handler(CommandHandler("autopost",       set_mode_autopost))
     app.add_handler(CommandHandler("start_autopost", start_autopost))
-    app.add_handler(CommandHandler("stop_autopost", stop_autopost))
-    app.add_handler(CommandHandler("pause", pause_all))
-    app.add_handler(CommandHandler("resume", resume_all))
-    app.add_handler(CommandHandler("crashed", crashed))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("reset", reset))
-    
+    app.add_handler(CommandHandler("stop_autopost",  stop_autopost))
+    app.add_handler(CommandHandler("crashed",        crashed))
+    app.add_handler(CommandHandler("help",           help_cmd))
     # Кнопки из планировщика
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.Regex(r"(Неа|Ага)"),
         catch_buttons
     ))
-    
-    # Запускаем задания для всех пользователей (только не на паузе)
-    app.job_queue.start()
-    for user_id in get_all_users():
-        schedule_for_user(app, user_id)
-    
+
+    # Восстанавливаем задания для всех пользователей
+    restore_jobs(app)
+
     logger.info("Бот запущен!")
     app.run_polling()
 
@@ -845,10 +589,11 @@ def main():
 if __name__ == "__main__":
     import asyncio
     import sys
-    
+
+    # Фикс для Python 3.14 на Windows
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     main()
