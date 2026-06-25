@@ -20,6 +20,7 @@ from telegram.ext import (
 # - НАСТРОЙКИ -----------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DB_PATH   = os.environ.get("DB_PATH", "/var/lib/bike_crash_bot/state.db")
+ACTIONS_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_actions.log")
 
 # - СОСТОЯНИЯ ДИАЛОГОВ --------------------------------------------------------
 WAITING_FOR_CHANNEL = 10
@@ -100,6 +101,12 @@ def freq_to_label(freq):
 def job_name(user_id):
     """Имя задания планировщика для пользователя."""
     return f"job_{user_id}"
+
+def log_action(user_id, action):
+    """Добавляет читаемую запись о действии пользователя в лог-файл рядом со скриптом."""
+    now = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    with open(ACTIONS_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(f"Пользователь {user_id} {now} сделал: {action}\n")
 
 async def delete_last_message(bot, user):
     """Удаляет последнее сообщение бота в канале пользователя."""
@@ -233,7 +240,6 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
             chat_id=channel_id,
             text="🔧 Проверка подключения... сейчас удалю это сообщение."
         )
-        await context.bot.delete_message(chat_id=channel_id, message_id=test_msg.message_id)
     except Exception as e:
         await update.message.reply_text(
             f"❌ Не могу написать в канал `{channel_id}`.\n\n"
@@ -245,8 +251,15 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return WAITING_FOR_CHANNEL
 
+    # Удаление тестового сообщения не критично - канал уже подтверждён отправкой выше
+    try:
+        await context.bot.delete_message(chat_id=channel_id, message_id=test_msg.message_id)
+    except Exception as e:
+        logger.warning(f"Не смог удалить тестовое сообщение в канале {channel_id}: {e}")
+
     # Сохраняем и запускаем задание
     user_set(user_id, channel_id=channel_id)
+    log_action(user_id, f"подключил канал {channel_id}")
     reschedule_user(context.application, user_id, "7d")
 
     await update.message.reply_text(
@@ -305,6 +318,7 @@ async def set_mode_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала зарегистрируйся командой /start")
         return
     user_set(user_id, mode=1, running=0)
+    log_action(user_id, "включил режим опроса (/ask)")
     reschedule_user(context.application, user_id, user["freq"])
     await update.message.reply_text(
         "✅ Режим опроса включён.\n"
@@ -321,6 +335,7 @@ async def set_mode_autopost(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала зарегистрируйся командой /start")
         return
     user_set(user_id, mode=2)
+    log_action(user_id, "включил режим автопоста (/autopost)")
     await update.message.reply_text(
         "✅ Режим автопоста включён.\n"
         "Буду постить в канал сам без вопросов.\n"
@@ -340,6 +355,7 @@ async def start_autopost(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала переключись в режим автопоста командой /autopost")
         return
     user_set(user_id, running=1)
+    log_action(user_id, "запустил автопост (/start_autopost)")
     reschedule_user(context.application, user_id, user["freq"])
     await update.message.reply_text(
         f"▶️ Автопост запущен! Постю {freq_to_label(user['freq'])}.\n"
@@ -355,6 +371,7 @@ async def stop_autopost(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала зарегистрируйся командой /start")
         return
     user_set(user_id, running=0)
+    log_action(user_id, "остановил автопост (/stop_autopost)")
     await update.message.reply_text("⏸ Автопост остановлен.")
 
 
@@ -386,6 +403,7 @@ async def handle_freq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_FOR_FREQ
     user_set(user_id, freq=text)
+    log_action(user_id, f"установил частоту {text} (/setfreq)")
     reschedule_user(context.application, user_id, text)
     await update.message.reply_text(
         f"✅ Частота установлена: {freq_to_label(text)}",
@@ -418,6 +436,7 @@ async def handle_checkin_answer(update: Update, context: ContextTypes.DEFAULT_TY
 
     if "Неа" in text:
         await post_to_channel(context.bot, user, f"📅 {today}: всё ещё не размотался 🚴✅")
+        log_action(user_id, "ручной чекин (/checkin): не размотался")
         await update.message.reply_text(
             "Шикос, отправил в канал. Пусть завидуют 🎉",
             reply_markup=ReplyKeyboardRemove()
@@ -425,6 +444,7 @@ async def handle_checkin_answer(update: Update, context: ContextTypes.DEFAULT_TY
     elif "Ага" in text:
         await post_to_channel(context.bot, user, f"📅 {today}: всё-таки размотался 💥")
         user_set(user_id, running=0)
+        log_action(user_id, "ручной чекин (/checkin): размотался")
         await update.message.reply_text(
             "Ну в целом ожидаемо. Отправил в канал пусть посмеются.",
             reply_markup=ReplyKeyboardRemove()
@@ -450,6 +470,7 @@ async def crashed(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now().strftime("%d.%m.%Y")
     await post_to_channel(context.bot, user, f"📅 {today}: всё-таки размотался 💥")
     user_set(user_id, running=0)
+    log_action(user_id, "зафиксировал падение (/crashed)")
     await update.message.reply_text(
         "💥 Зафиксировал. Автопост остановлен.\n"
         "Надеюсь всё норм, дурак 🤕"
@@ -506,6 +527,7 @@ async def catch_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "Неа" in text:
         await post_to_channel(context.bot, user, f"📅 {today}: всё ещё не размотался 🚴✅")
+        log_action(user_id, "ответил на плановую проверку: не размотался")
         await update.message.reply_text(
             "Шикос, отправил в канал. Пусть завидуют 🎉",
             reply_markup=ReplyKeyboardRemove()
@@ -513,10 +535,18 @@ async def catch_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif "Ага" in text:
         await post_to_channel(context.bot, user, f"📅 {today}: всё-таки размотался 💥")
         user_set(user_id, running=0)
+        log_action(user_id, "ответил на плановую проверку: размотался")
         await update.message.reply_text(
             "Ну в целом ожидаемо. Отправил в канал пусть посмеются.",
             reply_markup=ReplyKeyboardRemove()
         )
+
+
+# - ОБРАБОТКА ОШИБОК -----------------------------------------------------------
+
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный обработчик необработанных исключений в хендлерах и заданиях."""
+    logger.error(f"Необработанная ошибка при обновлении {update}: {context.error}", exc_info=context.error)
 
 
 # - ЗАПУСК --------------------------------------------------------------------
@@ -578,6 +608,8 @@ def main():
         filters.TEXT & ~filters.COMMAND & filters.Regex(r"(Неа|Ага)"),
         catch_buttons
     ))
+
+    app.add_error_handler(error_handler)
 
     # Восстанавливаем задания для всех пользователей
     restore_jobs(app)

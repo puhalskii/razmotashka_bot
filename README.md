@@ -55,10 +55,11 @@
 
 ### Шаг 1 - Скачай файлы
 
-Положи в одну папку три файла:
+Положи в одну папку файлы:
 - `bike_crash_bot.py`
 - `bike_crash_bot.service`
 - `install.sh`
+- `uninstall.sh`
 
 ### Шаг 2 - Запусти установку
 
@@ -130,6 +131,22 @@ journalctl -u bike_crash_bot -f
 
 ---
 
+## Деинсталляция
+
+```bash
+sudo bash uninstall.sh
+```
+
+Останавливает и удаляет сервис, удаляет `/opt/bike_crash_bot` (скрипт, venv, лог действий).
+Про базу данных пользователей и системного пользователя `bike_bot` скрипт спросит отдельно.
+
+Чтобы удалить всё сразу без вопросов (включая БД пользователей):
+```bash
+sudo bash uninstall.sh --purge
+```
+
+---
+
 ## Настройка частоты
 
 Через команду /setfreq или кнопки в боте.
@@ -150,6 +167,7 @@ journalctl -u bike_crash_bot -f
 /opt/bike_crash_bot/
   bike_crash_bot.py     - основной скрипт
   venv/                 - виртуальное окружение Python
+  user_actions.log      - читаемый лог действий пользователей
 
 /var/lib/bike_crash_bot/
   state.db              - SQLite база со всеми пользователями
