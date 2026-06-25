@@ -53,38 +53,18 @@
 - Debian 11/12 с доступом root
 - Токен бота от @BotFather в Telegram
 
-### Шаг 1 - Скачай файлы
+### Установка одной командой
 
-Положи в одну папку файлы:
-- `bike_crash_bot.py`
-- `bike_crash_bot.service`
-- `install.sh`
-- `uninstall.sh`
-
-### Шаг 2 - Запусти установку
+Скрипт сам скачивает всё необходимое с GitHub - клонировать репозиторий не нужно.
 
 ```bash
-sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/puhalskii/razmotashka_bot/main/install.sh | sudo bash
 ```
 
-### Шаг 3 - Задай токен бота
-
-```bash
-nano /etc/systemd/system/bike_crash_bot.service
-```
-
-Замени значение:
-```
-Environment=BOT_TOKEN=сюда_токен_от_botfather
-```
-
-### Шаг 4 - Запусти бота
-
-```bash
-systemctl daemon-reload
-systemctl enable bike_crash_bot
-systemctl start bike_crash_bot
-```
+Скрипт спросит токен бота от @BotFather, проверит его через Telegram API,
+поставит зависимости, скачает `bike_crash_bot.py`, настроит systemd-сервис
+с этим токеном и сразу запустит бота. После установки можно сразу открыть
+бота в Telegram и написать `/start` - онбординг начнётся без дополнительных шагов.
 
 ### Проверить что работает
 
@@ -133,8 +113,10 @@ journalctl -u bike_crash_bot -f
 
 ## Деинсталляция
 
+Скрипт деинсталляции уже лежит на сервере после установки:
+
 ```bash
-sudo bash uninstall.sh
+sudo bash /opt/bike_crash_bot/uninstall.sh
 ```
 
 Останавливает и удаляет сервис, удаляет `/opt/bike_crash_bot` (скрипт, venv, лог действий).
@@ -142,7 +124,7 @@ sudo bash uninstall.sh
 
 Чтобы удалить всё сразу без вопросов (включая БД пользователей):
 ```bash
-sudo bash uninstall.sh --purge
+sudo bash /opt/bike_crash_bot/uninstall.sh --purge
 ```
 
 ---
@@ -166,6 +148,7 @@ sudo bash uninstall.sh --purge
 ```
 /opt/bike_crash_bot/
   bike_crash_bot.py     - основной скрипт
+  uninstall.sh          - скрипт деинсталляции
   venv/                 - виртуальное окружение Python
   user_actions.log      - читаемый лог действий пользователей
 
