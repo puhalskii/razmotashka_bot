@@ -343,6 +343,26 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
         channel_id = "@" + channel_id
 
     await update.message.reply_text("Проверяю доступ к каналу…")
+
+    # Канал может подключить только его админ - иначе любой пользователь бота
+    # мог бы привязать к себе чужой канал, зная его username (бот-то там уже стоит).
+    try:
+        member = await context.bot.get_chat_member(chat_id=channel_id, user_id=uid)
+    except Exception:
+        await update.message.reply_text(
+            f"❌ Не могу проверить канал {channel_id}.\n\n"
+            "Убедись, что канал существует и бот добавлен в него администратором.\n"
+            "Пришли username или ID ещё раз:"
+        )
+        return WAITING_FOR_CHANNEL
+
+    if member.status not in ("administrator", "creator"):
+        await update.message.reply_text(
+            f"❌ Ты не администратор канала {channel_id} - подключить канал может только его админ.\n"
+            "Пришли username или ID своего канала:"
+        )
+        return WAITING_FOR_CHANNEL
+
     try:
         test_msg = await context.bot.send_message(
             chat_id=channel_id, text="🔧 Проверка подключения… сейчас удалю это сообщение."
@@ -350,7 +370,7 @@ async def handle_channel_input(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         await update.message.reply_text(
             f"❌ Не могу написать в канал {channel_id}.\n\n"
-            "Проверь, что канал существует и бот добавлен администратором с правом постить.\n"
+            "Проверь, что бот добавлен администратором с правом постить сообщения.\n"
             "Пришли username или ID ещё раз:"
         )
         return WAITING_FOR_CHANNEL
